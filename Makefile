@@ -1,10 +1,11 @@
 APP_NAME   ?= route-to-ingress
-VERSION    ?= 0.1.1
+VERSION    ?= 0.2.0
 IMAGE_HOST ?= ghcr.io
 IMAGE_NAME ?= getupcloud/$(APP_NAME)
 IMAGE      := $(IMAGE_HOST)/$(IMAGE_NAME)
 
 CLUSTER_ISSUER     ?= letsencrypt-staging-http01
+DRY_RUN            ?= false
 INGRESS_CLASS_NAME ?= $(APP_NAME)
 NAMESPACE          ?= getup
 
@@ -26,6 +27,7 @@ run:
 		-v $(PWD):/app \
 		-v $(realpath $(KUBECONFIG)):/app/kubeconfig \
 		-e CLUSTER_ISSUER=$(CLUSTER_ISSUER) \
+		-e DRY_RUN=$(DRY_RUN) \
 		-e INGRESS_CLASS_NAME=$(INGRESS_CLASS_NAME) \
 		-e IGNORE_DANGEROUS_INGRESS_CLASS_NAME=$(IGNORE_DANGEROUS_INGRESS_CLASS_NAME) \
 		-e KUBECONFIG=/app/kubeconfig \

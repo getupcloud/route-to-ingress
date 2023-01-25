@@ -47,6 +47,9 @@ GROUP_CONFIG, GROUP_CONFIG_VERSION, GROUP_CONFIG_PLURAL = (
 )
 
 NAMESPACE = os.environ.get('NAMESPACE')
+DRY_RUN = (os.environ.get('DRY_RUN', 'false') == 'true')
+if DRY_RUN:
+    INFO('DRY_RUN is active')
 
 ANNOTATION_TLS_PREFIX = "tls.getup.io"
 # Ignore Routes with this annotation.
@@ -234,16 +237,25 @@ def make_ingress_from_route(meta, spec, body, ingress_id):
 
 def annotate_route(body, annotations):
     namespace, name = body["metadata"]["namespace"], body["metadata"]["name"]
-    INFO(f"Annotating Route: {namespace}/{name}: {annotations}")
+    INFO(f"Annotating Route: {namespace}/{name}")
     api = kube.client.CustomObjectsApi()
     try:
-        api.patch_namespaced_custom_object(
-            GROUP_ROUTE,
-            GROUP_ROUTE_VERSION,
-            namespace,
-            GROUP_ROUTE_PLURAL,
-            name,
-            body)
+        if DRY_RUN:
+            INFO('DRY_RUN: api.patch_namespaced_custom_object('
+                f'{GROUP_ROUTE}, '
+                f'{GROUP_ROUTE_VERSION}, '
+                f'{namespace}, '
+                f'{GROUP_ROUTE_PLURAL}, '
+                f'{name}, '
+                'body)')
+        else:
+            api.patch_namespaced_custom_object(
+                GROUP_ROUTE,
+                GROUP_ROUTE_VERSION,
+                namespace,
+                GROUP_ROUTE_PLURAL,
+                name,
+                body)
     except kube.client.exceptions.ApiException as ex:
         ERROR(f"Failed api call: patch_namespaced_custom_object({GROUP_ROUTE}, {GROUP_ROUTE_VERSION}, namespace={namespace}, {GROUP_ROUTE_PLURAL}, name={name}, body=route): {ex}")
 
@@ -281,7 +293,10 @@ def handle_route_create(meta, spec, body):
 
     api = kube.client.NetworkingV1Api()
     try:
-        api.create_namespaced_ingress(namespace=meta["namespace"], body=ingress)
+        if DRY_RUN:
+            INFO(f'DRY_RUN: api.create_namespaced_ingress(namespace={meta["namespace"]}, body=ingress)')
+        else:
+            api.create_namespaced_ingress(namespace=meta["namespace"], body=ingress)
     except kube.client.exceptions.ApiException as ex:
         ERROR(f'Failed api call: create_namespaced_ingress(namespace={meta["namespace"]}, name={ingress["metadata"]["name"]}, body=ingress): {ex}')
 
@@ -308,11 +323,16 @@ def handle_route_update(meta, spec, body):
     ## Create ingress from Route
     api = kube.client.NetworkingV1Api()
     try:
-        api.patch_namespaced_ingress(
-            namespace=ingress["metadata"]["namespace"],
-            name=ingress["metadata"]["name"],
-            body=ingress,
-        )
+        if DRY_RUN:
+            INFO('DRY_RUN: api.patch_namespaced_ingress('
+                f'namespace={ingress["metadata"]["namespace"]}, '
+                f'name={ingress["metadata"]["name"]}, '
+                'body=ingress)')
+        else:
+            api.patch_namespaced_ingress(
+                namespace=ingress["metadata"]["namespace"],
+                name=ingress["metadata"]["name"],
+                body=ingress)
     except kube.client.exceptions.ApiException as ex:
         ERROR(f'Failed api call: patch_namespaced_ingress(namespace={ingress["metadata"]["namespace"]}, name={ingress["metadata"]["name"]}, body=ingress): {ex}')
 
@@ -322,12 +342,15 @@ def handle_route_update(meta, spec, body):
 def handle_route_delete(meta, spec, body):
     ingress = CACHE.delete(meta)
 
-    if get_ingress_id(ingress):
+    if ingress and get_ingress_id(ingress):
         INFO(f'Deleting ingress: {meta["namespace"]}/{meta["name"]}')
         namespace, name = ingress["metadata"]["namespace"], ingress["metadata"]["name"]
         api = kube.client.NetworkingV1Api()
         try:
-            api.delete_namespaced_ingress(namespace=namespace, name=name)
+            if DRY_RUN:
+                INFO(f'DRY_RUN: api.delete_namespaced_ingress(namespace={namespace}, name={name})')
+            else:
+                api.delete_namespaced_ingress(namespace=namespace, name=name)
         except kube.client.exceptions.ApiException as ex:
             ERROR(f"Failed api call: delete_namespaced_ingress(namespace={namespace}, name={name}): {ex}")
 
