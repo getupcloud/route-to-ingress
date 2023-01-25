@@ -221,16 +221,20 @@ def get_ingress_id(ingress):
 
 
 def make_ingress_from_route(meta, spec, body, ingress_id):
+    try:
+        service_port = {"number": int(spec["port"]["targetPort"])}
+    except (KeyError, ValueError):
+        try:
+            service_port = {"name": spec["port"]["targetPort"]}
+        except (KeyError, ValueError):
+            INFO(f'Ignoring Route without service port: {meta["namespace"]}/{meta["name"]}')
+            return
+
     api_version = body["apiVersion"]
     has_tls = spec.get("tls", {}).get("termination", "").lower() not in ["", "passthrough"]
     host = spec.get("host")
     path = spec.get("path", "/")
     service_name = spec["to"]["name"]
-
-    try:
-        service_port = {"number": int(spec["port"]["targetPort"])}
-    except (KeyError, ValueError):
-        service_port = {"name": spec["port"]["targetPort"]}
 
     return make_ingress(meta, api_version, host, path, service_name, service_port, has_tls, ingress_id)
 
@@ -288,6 +292,9 @@ def handle_route_create(meta, spec, body):
 
     ingress = make_ingress_from_route(meta, spec, body, ingress_id)
 
+    if not ingress:
+        return
+
     INFO(f'Creating ingress: {meta["namespace"]}/{meta["name"]}')
     DEBUG(JSON(ingress))
 
@@ -316,6 +323,9 @@ def handle_route_update(meta, spec, body):
         return handle_route_create(meta, spec, body)
 
     ingress = make_ingress_from_route(meta, spec, body, ingress_id)
+
+    if not ingress:
+        return
 
     INFO(f'Updating ingress: {meta["namespace"]}/{meta["name"]}')
     DEBUG(JSON(ingress))
