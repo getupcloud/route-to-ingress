@@ -1,5 +1,5 @@
 APP_NAME   ?= route-to-ingress
-VERSION    ?= 0.1.0
+VERSION    ?= 0.1.1
 IMAGE_HOST ?= ghcr.io
 IMAGE_NAME ?= getupcloud/$(APP_NAME)
 IMAGE      := $(IMAGE_HOST)/$(IMAGE_NAME)
@@ -40,4 +40,8 @@ push p:
 	docker push $(IMAGE):$(VERSION)
 	docker push $(IMAGE):latest
 
-release r: build push
+.PHONY: manifests
+manifests:
+	sed -i -e 's|image: $(IMAGE):.*|image: $(IMAGE):$(VERSION)|' manifests/deployment.yaml
+
+release r: build manifests push

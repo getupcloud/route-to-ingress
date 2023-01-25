@@ -46,7 +46,7 @@ GROUP_CONFIG, GROUP_CONFIG_VERSION, GROUP_CONFIG_PLURAL = (
     "ingresses",
 )
 
-NAMESPACE = os.environ('NAMESPACE')
+NAMESPACE = os.environ.get('NAMESPACE')
 
 ANNOTATION_TLS_PREFIX = "tls.getup.io"
 # Ignore Routes with this annotation.
@@ -450,7 +450,7 @@ if __name__ == "__main__":
         INFO("Using in-cluster config")
         kube.config.load_incluster_config()
     else:
-        INFO(f'Using KUBECONFIG={os.environ["KUBECONFIG"]}')
+        INFO(f'Using KUBECONFIG={os.environ.get("KUBECONFIG", "")}')
         kube.config.load_kube_config()
 
     api_client = kube.client.api_client.ApiClient()
