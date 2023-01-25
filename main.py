@@ -19,7 +19,8 @@ import kubernetes as kube
 # from openshift.dynamic import DynamicClient
 PID = os.getpid()
 logging.basicConfig(
-    format=f'time="%(asctime)s" pid={PID} level=%(levelname)s message="%(message)s"',
+    #format=f'time="%(asctime)s" pid=%(process)d file=%(funcName)s:%(lineno)d level=%(levelname)s message="%(message)s"',
+    format=f'time="%(asctime)s" level=%(levelname)s message="%(message)s"',
     level=logging.INFO,
 )
 
@@ -46,6 +47,8 @@ GROUP_CONFIG, GROUP_CONFIG_VERSION, GROUP_CONFIG_PLURAL = (
     "ingresses",
 )
 
+VALID_TLS_TERMINATIONS = ("edge", "reencrypt")
+
 NAMESPACE = os.environ.get('NAMESPACE')
 DRY_RUN = (os.environ.get('DRY_RUN', 'false') == 'true')
 if DRY_RUN:
@@ -61,8 +64,10 @@ ANNOTATION_TLS_SOURCE_ROUTE = f"{ANNOTATION_TLS_PREFIX}/source-route"
 # Prefix used by short hostname.
 ANNOTATION_TLS_INGRESS_ID = f"{ANNOTATION_TLS_PREFIX}/ingress-id"
 
-# Certmanager solver annotation
-ANNOTATIONS_CERTMANAGER_HTTP01_SOLVER = "acme.cert-manager.io/http01-solver"
+# Certmanager annotations
+ANNOTATIONS_CERTMANAGER = "cert-manager.io"
+ANNOTATIONS_CERTMANAGER_HTTP01_SOLVER = f"acme.{ANNOTATIONS_CERTMANAGER}/http01-solver"
+ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER = f"{ANNOTATIONS_CERTMANAGER}/cluster-issuer"
 
 # Cert Utils Operator namespace - https://github.com/redhat-cop/cert-utils-operator
 ANNOTATIONS_CERT_UTILS_OPERATOR = "cert-utils-operator.redhat-cop.io"
@@ -87,15 +92,18 @@ if (ENV_INGRESS_CLASS_NAME == "openshift-default" and ENV_IGNORE_DANGEROUS_INGRE
     sys.exit(1)
 
 
+############################################
+## Common utils
+
 class Cache:
     INGRESS_CACHE = {}
 
     def _key(self, meta):
-        return "/".join([meta.get("namespace", "_"), meta["name"]])
+        return (meta['namespace'], meta['name'])
 
     def set(self, obj):
-        key = self._key(obj["metadata"])
-        INFO(f"Add cache: {key}")
+        key = self._key(obj['metadata'])
+        DEBUG(f"Add cache: {key}")
         self.INGRESS_CACHE[key] = obj
         return obj
 
@@ -104,29 +112,44 @@ class Cache:
         obj = self.INGRESS_CACHE.get(key, None)
 
         if obj:
-            INFO(f"Hit cache: {key}")
+            DEBUG(f"Hit cache: {key}")
         else:
-            INFO(f"Miss cache: {key}")
+            DEBUG(f"Miss cache: {key}")
 
         return obj
 
     def delete(self, meta):
         key = self._key(meta)
-        INFO(f"Delete cache: {key}")
+        DEBUG(f"Delete cache: {key}")
         self.INGRESS_CACHE.pop(key, None)
 
 
 CACHE = Cache()
 
+def discover_ingress_domain(api_client):
+    api = kube.client.CustomObjectsApi(api_client)
+    try:
+        config = api.get_cluster_custom_object(
+            GROUP_CONFIG,
+            GROUP_CONFIG_VERSION,
+            GROUP_CONFIG_PLURAL,
+            ENV_INGRESS_CONFIG_NAME,
+        )
+        return config["spec"]["domain"]
+    except (KeyError, kube.client.exceptions.ApiException) as ex:
+        ERROR(f"Failed to query for cluster domain ({GROUP_CONFIG_VERSION}.{GROUP_CONFIG}/{ENV_INGRESS_CONFIG_NAME}): {ex.status} {ex.reason}")
+        ERROR("Please set INGRESS_CONFIG_NAME or CLUSTER_DOMAIN")
+        sys.exit(1)
 
-def make_ingress_id():
-    return random.choice(string.ascii_lowercase) + "".join(
-        [random.choice(string.digits + string.ascii_lowercase) for i in range(5)]
-    )
+
+############################################
+## Route utils
 
 
-def ignore_route(meta):
+def ignore_route(route):
+    meta, spec = route['metadata'], route['spec']
     anns = meta.get("annotations", {})
+
     if anns.get(ANNOTATION_TLS_ROUTE_IGNORE, None) is not None:
         INFO(f"Ignoring route with annotation {ANNOTATION_TLS_ROUTE_IGNORE}")
         return True
@@ -141,15 +164,136 @@ def ignore_route(meta):
             INFO(f'Ignoring owned route by {ownerRef["kind"]}/{ownerRef["name"]} ({ownerRef["uid"]})')
         return True
 
+    tls_termination = spec.get("tls", {}).get("termination", "")
+    if tls_termination.lower() not in VALID_TLS_TERMINATIONS:
+        INFO(f'Ignoring Route with tls.termination="{tls_termination}". Requires one of: {", ".join(VALID_TLS_TERMINATIONS)}')
+        return True
+
+    port = spec.get('port', {})
+    if 'targetPort' not in port:
+        INFO(f'Ignoring Route without tls.port.targetPort')
+        return True
+
     return False
 
 
-def make_ingress(meta, api_version, host, path, service_name, service_port, has_tls, ingress_id):
+
+def patch_route(route):
+    meta, spec = route['metadata'], route['spec']
+    namespace, name = meta["namespace"], meta["name"]
+    api = kube.client.CustomObjectsApi()
+
+    # TODO: remove unnecessary fields prior patching
+    try:
+        if DRY_RUN:
+            INFO('DRY_RUN: api.patch_namespaced_custom_object('
+                f'{GROUP_ROUTE}, '
+                f'{GROUP_ROUTE_VERSION}, '
+                f'{namespace}, '
+                f'{GROUP_ROUTE_PLURAL}, '
+                f'{name}, '
+                'body=route)')
+        else:
+            api.patch_namespaced_custom_object(
+                GROUP_ROUTE,
+                GROUP_ROUTE_VERSION,
+                namespace,
+                GROUP_ROUTE_PLURAL,
+                name,
+                body=route)
+    except kube.client.exceptions.ApiException as ex:
+        ERROR(f"Failed api call: patch_namespaced_custom_object({GROUP_ROUTE}, {GROUP_ROUTE_VERSION}, namespace={namespace}, {GROUP_ROUTE_PLURAL}, name={name}, body=route): {ex.status} {ex.reason} {ex.body}")
+        DEBUG(JSON(route))
+
+
+def ensure_route(route, ingress):
+    changed = False
+    if not route['metadata'].get('annotations', {}).get(ANNOTATIONS_CERT_UTILS_OPERATOR_CERTS_FROM_SECRET):
+        if 'annotations' not in route['metadata']:
+            route['metadata']['annotations'] = {}
+        route['metadata']['annotations'][ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER] = ingress["spec"]["tls"][0]["secretName"]
+        changed = True
+
+    if changed:
+        patch_route(route)
+
+
+############################################
+# Route Handlers
+
+
+def handle_route_create(meta, spec, route):
+    ingress = CACHE.get(meta)
+
+    if not ingress:
+        ingress = create_ingress(route)
+    else:
+        ensure_ingress(ingress)
+
+    ensure_route(route, ingress)
+
+
+def handle_route_update(meta, spec, route):
+    ingress = CACHE.get(meta)
+
+    if not ingress:
+        ingress = create_ingress(route)
+    else:
+        ensure_ingress(ingress)
+
+    ensure_route(route, ingress)
+
+
+def handle_route_delete(meta, spec, route):
+    ingress = CACHE.get(meta)
+
+    if ingress:
+        delete_ingress(ingress)
+
+
+############################################
+## Ingress utils
+
+def ignore_ingress(ingress):
+    if get_ingress_id(ingress) == None:
+        INFO(f"Ignoring Ingress without ingress-id annotation")
+        return True
+
+    return False
+
+def make_ingress_id():
+    return (random.choice(string.ascii_lowercase)
+            + "".join([random.choice(string.digits + string.ascii_lowercase) for i in range(5)]))
+
+
+def get_ingress_id(ingress):
+    return (
+        ingress.get("metadata", {})
+        .get("annotations", {})
+        .get(ANNOTATION_TLS_INGRESS_ID, None)
+    )
+
+
+def make_ingress(route):
+    meta, spec = route['metadata'], route['spec']
+    namespace, name = meta["namespace"], meta["name"]
+
+    try:
+        service_port = {"number": int(spec["port"]["targetPort"])}
+    except ValueError:
+        service_port = {"name": spec["port"]["targetPort"]}
+
+    api_version = route["apiVersion"]
+    host = spec.get("host")
+    path = spec.get("path", "/")
+    service_name = spec["to"]["name"]
+    ingress_id = make_ingress_id()
+
     INFO(f"make_ingress(api_version={api_version}, host={host}, path={path}, service_name={service_name}, service_port={service_port}, has_tls={has_tls}, ingress_id={ingress_id})")
 
     anns = {
-        "cert-manager.io/cluster-issuer": ENV_CLUSTER_ISSUER,
-        ANNOTATION_TLS_SOURCE_ROUTE: meta["name"],
+        ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER: ENV_CLUSTER_ISSUER,
+        ANNOTATION_TLS_SOURCE_ROUTE: name,
         ANNOTATION_TLS_INGRESS_ID: ingress_id,
     }
     for k, v in meta.get("annotations", {}).items():
@@ -158,13 +302,13 @@ def make_ingress(meta, api_version, host, path, service_name, service_port, has_
         else:
             INFO(f"Discarding annotation: {k}")
 
-    secret_name = anns.get(ANNOTATION_TLS_INGRESS_SECRET_NAME, f'{meta["name"]}-ingress-tls')
+    secret_name = anns.get(ANNOTATION_TLS_INGRESS_SECRET_NAME, f'{name}-ingress-tls')
     ingress_class_name = anns.pop("kubernetes.io/ingress.class", ENV_INGRESS_CLASS_NAME)
 
-    ingress = {
+    return {
         "metadata": {
-            "name": meta["name"],
-            "namespace": meta["namespace"],
+            "name": name,
+            "namespace": namespace,
             "annotations": anns,
             "labels": meta.get("labels", {}),
             "ownerReferences": [
@@ -172,7 +316,7 @@ def make_ingress(meta, api_version, host, path, service_name, service_port, has_
                     "apiVersion": api_version,
                     "controller": True,
                     "kind": "Route",
-                    "name": meta["name"],
+                    "name": name,
                     "uid": meta["uid"],
                 }
             ],
@@ -198,192 +342,113 @@ def make_ingress(meta, api_version, host, path, service_name, service_port, has_
                     },
                 }
             ],
-        },
+            "tls": [
+                {
+                    "hosts": [f"{ingress_id}.{ENV_CLUSTER_DOMAIN}", host],
+                    "secretName": secret_name,
+                }
+            ]
+        }
     }
 
-    if has_tls:
-        ingress["spec"]["tls"] = [
-            {
-                "hosts": [f"{ingress_id}.{ENV_CLUSTER_DOMAIN}", host],
-                "secretName": secret_name,
-            }
-        ]
+
+def create_ingress(route):
+    meta, spec = route['metadata'], route['spec']
+    namespace, name = meta["namespace"], meta["name"]
+
+    INFO(f"New Ingress ID: {ingress_id}")
+    ingress = make_ingress(route)
+
+    if not ingress:
+        # not enough data to create an Ingress
+        return
+
+    INFO(f'Creating ingress: {namespace}/{name}')
+    DEBUG(JSON(ingress))
+
+    api = kube.client.NetworkingV1Api()
+    try:
+        if DRY_RUN:
+            INFO(f'DRY_RUN: api.create_namespaced_ingress(namespace={namespace}, name={name}, body=ingress)')
+        else:
+            api.create_namespaced_ingress(namespace=namespace, body=ingress)
+    except kube.client.exceptions.ApiException as ex:
+        ERROR(f'Failed api call: create_namespaced_ingress(namespace={amespace}, name={name}, body={ingress}): {ex.status} {ex.reason}')
 
     return ingress
 
 
-def get_ingress_id(ingress):
-    return (
-        ingress.get("metadata", {})
-        .get("annotations", {})
-        .get(ANNOTATION_TLS_INGRESS_ID, None)
-    )
-
-
-def make_ingress_from_route(meta, spec, body, ingress_id):
-    try:
-        service_port = {"number": int(spec["port"]["targetPort"])}
-    except (KeyError, ValueError):
-        try:
-            service_port = {"name": spec["port"]["targetPort"]}
-        except (KeyError, ValueError):
-            INFO(f'Ignoring Route without service port: {meta["namespace"]}/{meta["name"]}')
-            return
-
-    api_version = body["apiVersion"]
-    has_tls = spec.get("tls", {}).get("termination", "").lower() not in ["", "passthrough"]
-    host = spec.get("host")
-    path = spec.get("path", "/")
-    service_name = spec["to"]["name"]
-
-    return make_ingress(meta, api_version, host, path, service_name, service_port, has_tls, ingress_id)
-
-
-def annotate_route(body, annotations):
-    namespace, name = body["metadata"]["namespace"], body["metadata"]["name"]
-    INFO(f"Annotating Route: {namespace}/{name}")
-    api = kube.client.CustomObjectsApi()
-    try:
-        if DRY_RUN:
-            INFO('DRY_RUN: api.patch_namespaced_custom_object('
-                f'{GROUP_ROUTE}, '
-                f'{GROUP_ROUTE_VERSION}, '
-                f'{namespace}, '
-                f'{GROUP_ROUTE_PLURAL}, '
-                f'{name}, '
-                'body)')
-        else:
-            api.patch_namespaced_custom_object(
-                GROUP_ROUTE,
-                GROUP_ROUTE_VERSION,
-                namespace,
-                GROUP_ROUTE_PLURAL,
-                name,
-                body)
-    except kube.client.exceptions.ApiException as ex:
-        ERROR(f"Failed api call: patch_namespaced_custom_object({GROUP_ROUTE}, {GROUP_ROUTE_VERSION}, namespace={namespace}, {GROUP_ROUTE_PLURAL}, name={name}, body=route): {ex}")
-
-
-def set_route_secret_name_annotations(route, ingress):
-    anns = route["metadata"].get("annotations", {})
-    if ANNOTATIONS_CERT_UTILS_OPERATOR_CERTS_FROM_SECRET not in anns:
-        try:
-            anns[ANNOTATIONS_CERT_UTILS_OPERATOR_CERTS_FROM_SECRET] = ingress["spec"]["tls"][0]["secretName"]
-            annotate_route(body, anns)
-        except (KeyError, IndexError):
-            pass
-
-
-def handle_route_create(meta, spec, body):
-    cached = CACHE.get(meta)
-
-    if cached:
-        set_route_secret_name_annotations(body, cached)
-        ingress_id = get_ingress_id(cached)
-        if not ingress_id:
-            INFO(f'Ignoring unmanaged Ingress: {meta["namespace"]}/{meta["name"]}')
-            return
-        else:
-            INFO(f'Ignoring existing Ingress: {meta["namespace"]}/{meta["name"]} with Ingress ID {ingress_id}')
-            return
-    else:
-        ingress_id = make_ingress_id()
-        INFO(f"New Ingress ID: {ingress_id}")
-
-    ingress = make_ingress_from_route(meta, spec, body, ingress_id)
-
-    if not ingress:
-        return
-
-    INFO(f'Creating ingress: {meta["namespace"]}/{meta["name"]}')
-    DEBUG(JSON(ingress))
-
+def patch_ingress(namespace, name, ingress):
     api = kube.client.NetworkingV1Api()
-    try:
-        if DRY_RUN:
-            INFO(f'DRY_RUN: api.create_namespaced_ingress(namespace={meta["namespace"]}, body=ingress)')
-        else:
-            api.create_namespaced_ingress(namespace=meta["namespace"], body=ingress)
-    except kube.client.exceptions.ApiException as ex:
-        ERROR(f'Failed api call: create_namespaced_ingress(namespace={meta["namespace"]}, name={ingress["metadata"]["name"]}, body=ingress): {ex}')
-
-    set_route_secret_name_annotations(body, ingress)
-
-
-def handle_route_update(meta, spec, body):
-    cached = CACHE.get(meta)
-
-    if cached:
-        set_route_secret_name_annotations(body, cached)
-        ingress_id = get_ingress_id(cached)
-        if not ingress_id:
-            INFO(f'Ignoring unmanaged Ingress: {meta["namespace"]}/{meta["name"]}')
-            return
-    else:
-        return handle_route_create(meta, spec, body)
-
-    ingress = make_ingress_from_route(meta, spec, body, ingress_id)
-
-    if not ingress:
-        return
-
-    INFO(f'Updating ingress: {meta["namespace"]}/{meta["name"]}')
-    DEBUG(JSON(ingress))
-
-    ## Create ingress from Route
-    api = kube.client.NetworkingV1Api()
+    # TODO: remove unnecessary fields prior patching
     try:
         if DRY_RUN:
             INFO('DRY_RUN: api.patch_namespaced_ingress('
-                f'namespace={ingress["metadata"]["namespace"]}, '
-                f'name={ingress["metadata"]["name"]}, '
+                f'namespace={namespace}, '
+                f'name={name}, '
                 'body=ingress)')
         else:
             api.patch_namespaced_ingress(
-                namespace=ingress["metadata"]["namespace"],
-                name=ingress["metadata"]["name"],
+                namespace=namespace,
+                name=name,
                 body=ingress)
     except kube.client.exceptions.ApiException as ex:
-        ERROR(f'Failed api call: patch_namespaced_ingress(namespace={ingress["metadata"]["namespace"]}, name={ingress["metadata"]["name"]}, body=ingress): {ex}')
-
-    set_route_secret_name_annotations(body, cached)
-
-
-def handle_route_delete(meta, spec, body):
-    ingress = CACHE.delete(meta)
-
-    if ingress and get_ingress_id(ingress):
-        INFO(f'Deleting ingress: {meta["namespace"]}/{meta["name"]}')
-        namespace, name = ingress["metadata"]["namespace"], ingress["metadata"]["name"]
-        api = kube.client.NetworkingV1Api()
-        try:
-            if DRY_RUN:
-                INFO(f'DRY_RUN: api.delete_namespaced_ingress(namespace={namespace}, name={name})')
-            else:
-                api.delete_namespaced_ingress(namespace=namespace, name=name)
-        except kube.client.exceptions.ApiException as ex:
-            ERROR(f"Failed api call: delete_namespaced_ingress(namespace={namespace}, name={name}): {ex}")
+        ERROR(f'Failed api call: patch_namespaced_ingress(namespace={namespace}, name={name}, body=<below>): {ex.status} {ex.reason} {ex.body}')
+        DEBUG(JSON(ingress))
 
 
-def discover_ingress_domain(api_client):
-    api = kube.client.CustomObjectsApi(api_client)
+def ensure_ingress(ingress):
+    meta, spec = ingress['metadata'], ingress['spec']
+    changed = False
+
+    if ingress['metadata'].get('annotations', {}).get(ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER) != ENV_CLUSTER_ISSUER:
+        if 'annotations' not in ingress['metadata']:
+            ingress['metadata']['annotations'] = {}
+        ingress['metadata']['annotations'][ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER] = ENV_CLUSTER_ISSUER
+        changed = True
+
+    if changed:
+        patch_ingress(ingress['metadata']['namespace'], ingress['metadata']['name'], ingress)
+
+
+def delete_ingress(ingress):
+    meta, spec = ingress['metadata'], ingress['spec']
+    namespace, name = meta["namespace"], meta["name"]
+    api = kube.client.NetworkingV1Api()
+
+    INFO(f'Deleting ingress: {namespace}/{name}')
     try:
-        config = api.get_cluster_custom_object(
-            GROUP_CONFIG,
-            GROUP_CONFIG_VERSION,
-            GROUP_CONFIG_PLURAL,
-            ENV_INGRESS_CONFIG_NAME,
-        )
-        return config["spec"]["domain"]
-    except (KeyError, kube.client.exceptions.ApiException) as ex:
-        ERROR(f"Failed to query for cluster domain ({GROUP_CONFIG_VERSION}.{GROUP_CONFIG}/{ENV_INGRESS_CONFIG_NAME}): {ex}")
-        ERROR("Please set INGRESS_CONFIG_NAME or CLUSTER_DOMAIN")
-        sys.exit(1)
+        if DRY_RUN:
+            INFO(f'DRY_RUN: api.delete_namespaced_ingress(namespace={namespace}, name={name})')
+        else:
+            api.delete_namespaced_ingress(namespace=namespace, name=name)
+    except kube.client.exceptions.ApiException as ex:
+        ERROR(f"Failed api call: delete_namespaced_ingress(namespace={namespace}, name={name}): {ex.status} {ex.reason}")
+
+
+############################################
+# Ingress Handlers
+
+
+def handle_ingress_create(meta, spec, ingress):
+    CACHE.set(ingress)
+    ensure_ingress(ingress)
+
+
+def handle_ingress_update(meta, spec, ingress):
+    CACHE.set(ingress)
+
+    ensure_ingress(meta, spec, ingress)
+
+
+def handle_ingress_delete(meta, spec, ingress):
+    CACHE.delete(meta)
 
 
 ########################################################################33
 
 
+# TODO: unify both informers
 class RouteInformer(Thread):
     def __init__(self, api_client, queue, namespace, stop_event):
         Thread.__init__(self, name="RouteInformer")
@@ -408,8 +473,7 @@ class RouteInformer(Thread):
                             self.namespace,
                             GROUP_ROUTE_PLURAL,
                             resource_version=resource_version,
-                            timeout_seconds=0,
-                        )
+                            timeout_seconds=0)
                     else:
                         self.stream = self.watcher.stream(
                             self.api_instance.list_cluster_custom_object,
@@ -417,8 +481,7 @@ class RouteInformer(Thread):
                             GROUP_ROUTE_VERSION,
                             GROUP_ROUTE_PLURAL,
                             resource_version=resource_version,
-                            timeout_seconds=0,
-                        )
+                            timeout_seconds=0)
                     for event in self.stream:
                         DEBUG(JSON(event))
                         self.queue.put(event)
@@ -455,16 +518,25 @@ class IngressInformer(Thread):
                             timeout_seconds=0)
                     for event in self.stream:
                         DEBUG(JSON(event))
-                        event["object"] = event["object"].to_dict()
                         self.queue.put(event)
                 except Exception as ex:
                     INFO(f"Reconnecting {self.name}: {ex}")
 
 
+########################################################################33
+## Main
+
+exit_count = 3
+
 def sig_handler(signum, frame):
-    INFO(f"Signal handler called with signal {signum}")
-    queue.put("exit")
-    signal.setitimer(signal.ITIMER_REAL, 30)
+    if exit_count > 1:
+        INFO(f"Signal handler called with signal {signum}")
+        queue.put("exit")
+        signal.setitimer(signal.ITIMER_REAL, 30)
+        exit_count = exit_count - 1
+    else:
+        INFO(f"Signal handler called with signal {signum}. Forced exit...")
+        sys.exit(2)
 
 
 def force_exit(signum, frame):
@@ -487,7 +559,7 @@ if __name__ == "__main__":
     api_client = kube.client.api_client.ApiClient()
 
     if not ENV_CLUSTER_DOMAIN:
-        ENV_INGRESS_CLASS_NAME = discover_ingress_domain(api_client)
+        ENV_CLUSTER_DOMAIN = discover_ingress_domain(api_client)
         INFO(f"Found Ingress domain: {ENV_INGRESS_CLASS_NAME}")
 
     queue = Queue()
@@ -519,24 +591,30 @@ if __name__ == "__main__":
             ingress_informer.join(timeout=2)
             sys.exit(0)
 
-        oper = event["type"]
-        body = event["object"]
-        kind = body["kind"]
-        meta = body["metadata"]
+        oper = event['type']
+        body = event['raw_object']
+        kind = body['kind']
+        meta = body['metadata']
+        spec = body['spec']
+
+        if not spec:
+            continue
 
         INFO(f'{oper} {body["kind"]} {meta["namespace"]}/{meta["name"]}')
-        if kind == "Ingress":
-            if oper == "ADDED" or oper == "MODIFIED":
-                CACHE.set(body)
-            elif oper == "DELETED":
-                CACHE.delete(meta)
 
-        if kind == "Route":
-            if ignore_route(meta):
+        if kind == "Ingress":
+            if ignore_ingress(body):
                 continue
 
-            spec = body.get("spec")
-            if not spec:
+            if oper == "ADDED":
+                handle_ingress_create(meta, spec, body)
+            elif oper == "MODIFIED":
+                handle_ingress_update(meta, spec, body)
+            elif oper == "DELETED":
+                handle_ingress_delete(meta, spec, body)
+
+        elif kind == "Route":
+            if ignore_route(body):
                 continue
 
             if oper == "ADDED":
