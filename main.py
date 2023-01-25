@@ -229,7 +229,7 @@ def make_ingress_from_route(meta, spec, body, ingress_id):
 
     try:
         service_port = {"number": int(spec["port"]["targetPort"])}
-    except ValueError:
+    except (KeyError, ValueError):
         service_port = {"name": spec["port"]["targetPort"]}
 
     return make_ingress(meta, api_version, host, path, service_name, service_port, has_tls, ingress_id)
@@ -437,14 +437,12 @@ class IngressInformer(Thread):
                             self.api_instance.list_namespaced_ingress,
                             self.namespace,
                             resource_version=resource_version,
-                            timeout_seconds=0,
-                        )
+                            timeout_seconds=0)
                     else:
                         self.stream = self.watcher.stream(
-                            self.api_instance.list_cluster_ingress,
+                            self.api_instance.list_ingress_for_all_namespaces,
                             resource_version=resource_version,
-                            timeout_seconds=0,
-                        )
+                            timeout_seconds=0)
                     for event in self.stream:
                         DEBUG(JSON(event))
                         event["object"] = event["object"].to_dict()
