@@ -46,4 +46,4 @@ push p:
 manifests:
 	sed -i -e 's|image: $(IMAGE):.*|image: $(IMAGE):$(VERSION)|' manifests/deployment.yaml
 
-release r: build manifests push
+release r: manifests build push
