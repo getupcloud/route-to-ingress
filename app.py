@@ -236,7 +236,7 @@ def patch_route(route):
                 f'{namespace}, '
                 f'{GROUP_ROUTE_PLURAL}, '
                 f'{name}, '
-                'body=route)')
+                f'body={route})')
         else:
             api.patch_namespaced_custom_object(
                 GROUP_ROUTE,
@@ -255,7 +255,7 @@ def ensure_route(route, ingress):
     if not route['metadata'].get('annotations', {}).get(ANNOTATIONS_CERT_UTILS_OPERATOR_CERTS_FROM_SECRET):
         if 'annotations' not in route['metadata']:
             route['metadata']['annotations'] = {}
-        route['metadata']['annotations'][ANNOTATION_CERT_MANAGER_CLUSTER_ISSUER] = ingress["spec"]["tls"][0]["secretName"]
+        route['metadata']['annotations'][ANNOTATIONS_CERT_UTILS_OPERATOR_CERTS_FROM_SECRET] = ingress["spec"]["tls"][0]["secretName"]
         changed = True
 
     if changed:
@@ -412,7 +412,7 @@ def create_ingress(route):
     api = kube.client.NetworkingV1Api()
     try:
         if args.dry_run:
-            INFO(f'DRY_RUN: api.create_namespaced_ingress(namespace={namespace}, name={name}, body=ingress)')
+            INFO(f'DRY_RUN: api.create_namespaced_ingress(namespace={namespace}, name={name}, body={ingress})')
         else:
             api.create_namespaced_ingress(namespace=namespace, body=ingress)
     except kube.client.exceptions.ApiException as ex:
@@ -429,7 +429,7 @@ def patch_ingress(namespace, name, ingress):
             INFO('DRY_RUN: api.patch_namespaced_ingress('
                 f'namespace={namespace}, '
                 f'name={name}, '
-                'body=ingress)')
+                'body={ingress})')
         else:
             api.patch_namespaced_ingress(
                 namespace=namespace,
@@ -553,6 +553,7 @@ class IngressInformer(Thread):
 exit_count = 3
 
 def sig_handler(signum, frame):
+    global exit_count
     if exit_count > 1:
         INFO(f"Signal handler called with signal {signum}")
         queue.put("exit")

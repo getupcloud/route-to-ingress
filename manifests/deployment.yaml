@@ -20,24 +20,20 @@ spec:
         app: route-to-ingress
     spec:
       containers:
-      - args:
-        - --cluster-issuer=letsencrypt-production-http01
-        image: ghcr.io/getupcloud/route-to-ingress:0.3.0
+      - image: ghcr.io/getupcloud/route-to-ingress:0.3.0
         imagePullPolicy: IfNotPresent
         env:
         - name: CLUSTER_DOMAIN
           value: ""
         - name: CLUSTER_ISSUER
-          value: "letsencrypt-staging-http01"
-        - name: DRY_RUN
-          value: "true"
+          value: "letsencrypt-production-http01"
         - name: IGNORE_DANGEROUS_INGRESS_CLASS_NAME
           value: "false"
         - name: INGRESS_CLASS_NAME
           value: "route-to-ingress"
         - name: INGRESS_CONFIG_NAME
           value: "cluster"
-        - name: NAMESPACE
+        - name: NAMESPACES
           value: ""
         name: controller
         resources:
