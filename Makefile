@@ -1,5 +1,5 @@
 APP_NAME   ?= route-to-ingress
-VERSION    ?= 0.3.1
+VERSION    ?= 0.3.2
 IMAGE_HOST ?= ghcr.io
 IMAGE_NAME ?= getupcloud/$(APP_NAME)
 IMAGE      := $(IMAGE_HOST)/$(IMAGE_NAME)
