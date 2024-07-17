@@ -11,6 +11,7 @@ NAMESPACES         ?= getup
 
 .ONESHELL:
 .EXPORT_ALL_VARIABLES:
+SHELL = /bin/bash
 
 all: build help
 
@@ -21,11 +22,12 @@ help:
 	@echo '  push:     Push image to repo $(IMAGE).'
 	@echo '  release:  Build and push.'
 
+
 KUBECONFIG ?= ~/.kube/config
 run:
 	docker run -it --rm --name $(APP_NAME) \
 		-v $(PWD):/app \
-		-v $(realpath $(KUBECONFIG)):/app/kubeconfig \
+		-v $(wildcard $(KUBECONFIG)):/app/kubeconfig \
 		-e CLUSTER_ISSUER=$(CLUSTER_ISSUER) \
 		-e DRY_RUN=$(DRY_RUN) \
 		-e INGRESS_CLASS_NAME=$(INGRESS_CLASS_NAME) \

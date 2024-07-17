@@ -29,13 +29,13 @@ DEFAULT_IGNORED_NAMESPACES = [ n.strip() for n in os.environ.get('IGNORED_NAMESP
     'openshift-image-registry',
     'openshift-ingress-canary'
 ])).split(',') ]
-DEFAULT_CLUSTER_DOMAIN = os.environ.get("CLUSTER_DOMAIN", "")
-DEFAULT_ALLOWED_DOMAINS = os.environ.get("ALLOWED_DOMAINS", "")
-DEFAULT_INGRESS_CONFIG_NAME = os.environ.get("INGRESS_CONFIG_NAME", "cluster")
+#DEFAULT_CLUSTER_DOMAIN = os.environ.get("CLUSTER_DOMAIN", "")
+#DEFAULT_ALLOWED_DOMAINS = os.environ.get("ALLOWED_DOMAINS", "")
+#DEFAULT_INGRESS_CONFIG_NAME = os.environ.get("INGRESS_CONFIG_NAME", "cluster")
+DEFAULT_INGRESS_CONTROLLER_NAME = os.environ.get("INGRESS_CONFIG_NAME", "*")
 DEFAULT_CLUSTER_ISSUER = os.environ.get("CLUSTER_ISSUER", "letsencrypt-staging-http01")
 DEFAULT_INGRESS_CLASS_NAME = os.environ.get("INGRESS_CLASS_NAME", "route-to-ingress")
 DEFAULT_IGNORE_DANGEROUS_INGRESS_CLASS_NAME = os.environ.get("IGNORE_DANGEROUS_INGRESS_CLASS_NAME", "false")
-
 
 GROUP_ROUTE, GROUP_ROUTE_VERSION, GROUP_ROUTE_PLURAL = (
     "route.openshift.io",
@@ -43,11 +43,18 @@ GROUP_ROUTE, GROUP_ROUTE_VERSION, GROUP_ROUTE_PLURAL = (
     "routes",
 )
 
-GROUP_CONFIG, GROUP_CONFIG_VERSION = (
-    "config.openshift.io",
+GROUP_OPERATOR, GROUP_OPERATOR_VERSION = (
+    "operator.openshift.io",
     "v1"
 )
-GROUP_CONFIG_INGRESS_PLURAL = "ingresses"
+
+#GROUP_CONFIG, GROUP_CONFIG_VERSION = (
+#    "config.openshift.io",
+#    "v1"
+#)
+
+#GROUP_CONFIG_INGRESS_PLURAL = "ingresses"
+GROUP_CONFIG_INGRESS_CONTROLLER_PLURAL = "ingresscontrollers"
 
 VALID_TLS_TERMINATIONS = ("edge", "reencrypt")
 
@@ -97,20 +104,20 @@ parser.add_argument('-i', '--ignored-namespaces',
     action="extend",
     default=DEFAULT_IGNORED_NAMESPACES)
 
-parser.add_argument('--cluster-domain',
-    help='Set cluster domain. Auto-dicovered if not specified.',
-    type=str,
-    nargs=1)
-
-parser.add_argument('--allowed-domains',
-    help='What domains will be processed from Routes. Any other will be ignored. Defaults to value from --cluster-domain or auto-dicovery.',
+parser.add_argument('--cluster-domains',
+    help='Allowed domains. Auto-dicovered from IngressControllers if not specified.',
     type=str,
     nargs='*')
 
-parser.add_argument('--ingress-config-name',
-    help=f'Object name for {GROUP_CONFIG}.{GROUP_CONFIG_INGRESS_PLURAL} for cluster-domain auto-dicover.',
-    type=str,
-    default=DEFAULT_INGRESS_CONFIG_NAME)
+#parser.add_argument('--allowed-domains',
+#    help='What domains will be processed from Routes. Any other will be ignored. Defaults to all domains from IngressControllers.',
+#    type=str,
+#    nargs='*')
+
+#parser.add_argument('--ingress-config-name',
+#    help=f'Object name for {GROUP_CONFIG}.{GROUP_CONFIG_INGRESS_PLURAL} for cluster-domain auto-dicover.',
+#    type=str,
+#    default=DEFAULT_INGRESS_CONFIG_NAME)
 
 parser.add_argument('--cluster-issuer',
     help='ClusterIssuer name to add into newly created Ingresses.',
@@ -170,19 +177,17 @@ class Cache:
 
 CACHE = Cache()
 
-def discover_ingress_domain(api_client):
+def discover_ingress_domains(api_client):
     api = kube.client.CustomObjectsApi(api_client)
     try:
-        config = api.get_cluster_custom_object(
-            GROUP_CONFIG,
-            GROUP_CONFIG_VERSION,
-            GROUP_CONFIG_INGRESS_PLURAL,
-            args.ingress_config_name,
+        ics = api.list_cluster_custom_object(
+            GROUP_OPERATOR,
+            GROUP_OPERATOR_VERSION,
+            GROUP_CONFIG_INGRESS_CONTROLLER_PLURAL
         )
-        return config["spec"]["domain"]
+        return [ ic["spec"]["domain"] for ic in ics ]
     except (KeyError, kube.client.exceptions.ApiException) as ex:
-        ERROR(f"Failed to query for cluster domain ({GROUP_CONFIG_VERSION}.{GROUP_CONFIG}/{args.ingress_config_name}): {ex.status} {ex.reason}")
-        ERROR("Please set INGRESS_CONFIG_NAME or CLUSTER_DOMAIN")
+        ERROR(f"Failed to query for cluster domain ({GROUP_OPERATOR}.{GROUP_OPERATOR_VERSION}/{GROUP_CONFIG_INGRESS_CONTROLLER_PLURAL}): {ex.status} {ex.reason}")
         sys.exit(1)
 
 
@@ -349,6 +354,11 @@ def make_ingress(route):
     secret_name = anns.get(ANNOTATION_TLS_INGRESS_SECRET_NAME, f'{name}-ingress-tls')
     ingress_class_name = anns.pop("kubernetes.io/ingress.class", args.ingress_class_name)
 
+    try:
+        router_canonical_hostnames = [ v for i in route['status']['ingress'] for k, v in i.items() if k == 'routerCanonicalHostname' ]
+    except KeyError:
+        return
+
     return {
         "metadata": {
             "name": name,
@@ -388,7 +398,7 @@ def make_ingress(route):
             ],
             "tls": [
                 {
-                    "hosts": [f"{ingress_id}.{args.cluster_domain}", host],
+                    "hosts": [ f"{ingress_id}.{rch}" for rch in router_canonical_hostnames if rch in args.cluster_domains ] + [ host ],
                     "secretName": secret_name,
                 }
             ]
@@ -602,8 +612,8 @@ if __name__ == "__main__":
 
     api_client = kube.client.api_client.ApiClient()
 
-    if not args.cluster_domain:
-        args.cluster_domain = discover_ingress_domain(api_client)
+    if not args.cluster_domains:
+        args.cluster_domains = discover_ingress_domains(api_client)
         INFO(f"Found Ingress domain: {args.ingress_class_name}")
 
     queue = Queue()
